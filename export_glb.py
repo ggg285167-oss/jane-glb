@@ -3,10 +3,9 @@
 用法：
     blender -b model.blend --python export_glb.py
 
-做的事：
-1. 遍历所有材质，补一个 Principled BSDF，把贴图连到 Base Color
-   （Goo Engine 的自定义节点在无头版 Blender 里不认，不补的话导出会是灰模）
-2. 导出模型 + 骨骼 + 动画到 Jane.glb
+v2 改进：
+- 递归进节点组（Goo Engine 的贴图藏在 group 里），把贴图挖出来
+- 对 GooEngine_ToonShader 这类自定义材质，强制换成 Principled BSDF 再连贴图
 """
 import bpy
 import os
@@ -17,67 +16,115 @@ def log(msg):
     print(f"[export] {msg}", flush=True)
 
 
-def find_image_node(node_tree):
-    """挑一张最像 albedo 的贴图"""
-    best = None
+KEYWORDS = ("base", "albedo", "diffuse", "color", "skin", "face", "hair",
+            "cloth", "body", "tex", "texture")
+
+
+def collect_image_nodes(node_tree, depth=0, seen=None):
+    """递归收集节点树（含节点组内部）里的图像纹理节点"""
+    if seen is None:
+        seen = set()
+    if node_tree is None or depth > 5:
+        return []
+    key = node_tree.name
+    if key in seen:
+        return []
+    seen.add(key)
+
+    found = []
     for n in node_tree.nodes:
-        if n.type != 'TEX_IMAGE' or n.image is None:
-            continue
-        name = (n.name + " " + (n.image.name or "")).lower()
-        if any(k in name for k in ("base", "albedo", "diffuse", "color", "skin", "face", "hair")):
-            return n
-        if best is None:
-            best = n
-    return best
+        if n.type == 'TEX_IMAGE' and n.image is not None:
+            found.append(n)
+        elif n.type == 'GROUP' and getattr(n, "node_tree", None) is not None:
+            found.extend(collect_image_nodes(n.node_tree, depth + 1, seen))
+    return found
+
+
+def pick_best(images):
+    """从候选贴图里挑最像 albedo 的一张"""
+    if not images:
+        return None
+    scored = []
+    for n in images:
+        name = ((n.name or "") + " " + (n.image.name or "")).lower()
+        score = sum(1 for k in KEYWORDS if k in name)
+        scored.append((score, n))
+    scored.sort(key=lambda x: -x[0])
+    return scored[0][1]
 
 
 def fix_materials():
-    fixed = 0
+    changed = 0
     for mat in bpy.data.materials:
         if mat is None or not mat.use_nodes or mat.node_tree is None:
             continue
         nt = mat.node_tree
 
-        bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
         out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
-
         if out is None:
             out = nt.nodes.new('ShaderNodeOutputMaterial')
             out.location = (600, 0)
 
+        # 找出当前接到 Surface 上的东西
+        surface_link = out.inputs['Surface'].links[0] if out.inputs['Surface'].is_linked else None
+        surface_node = surface_link.from_node if surface_link else None
+
+        goo_like = (surface_node is not None and surface_node.type == 'GROUP') or \
+                   ("goo" in (mat.name or "").lower())
+
+        bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+
+        if goo_like:
+            # 断开自定义着色器，换标准 BSDF，否则 glTF 导出器认不出来
+            if surface_link:
+                nt.links.remove(surface_link)
+            if bsdf is None:
+                bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
+                bsdf.location = (300, 0)
+            nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+            changed += 1
+
         if bsdf is None:
             bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
             bsdf.location = (300, 0)
-            fixed += 1
-
-        if not out.inputs['Surface'].is_linked:
             nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+            changed += 1
 
-        img = find_image_node(nt)
-        if img is not None and not bsdf.inputs['Base Color'].is_linked:
-            nt.links.new(img.outputs['Color'], bsdf.inputs['Base Color'])
-            try:
-                img.image.alpha_mode = 'CHANNEL_PACKED'
-            except Exception:
-                pass
+        # 递归找贴图
+        imgs = collect_image_nodes(nt)
+        best = pick_best(imgs)
 
-        # 半透明/头发这类，把 alpha 也接上
-        if img is not None and 'Alpha' in bsdf.inputs and not bsdf.inputs['Alpha'].is_linked:
-            try:
-                blend = getattr(mat, 'blend_method', 'OPAQUE')
-            except Exception:
-                blend = 'OPAQUE'
-            if blend in {'BLEND', 'HASHED', 'CLIP'}:
-                nt.links.new(img.outputs['Alpha'], bsdf.inputs['Alpha'])
+        if best is not None:
+            if not bsdf.inputs['Base Color'].is_linked:
+                nt.links.new(best.outputs['Color'], bsdf.inputs['Base Color'])
+            # 粗糙度用不上，保持默认
+            if 'Alpha' in bsdf.inputs and not bsdf.inputs['Alpha'].is_linked:
+                try:
+                    method = getattr(mat, "blend_method", "OPAQUE")
+                except Exception:
+                    method = "OPAQUE"
+                if method in {"BLEND", "HASHED", "CLIP"}:
+                    nt.links.new(best.outputs['Alpha'], bsdf.inputs['Alpha'])
 
-    log(f"材质处理完成，新建 BSDF 数量：{fixed}")
+    log(f"材质处理完成，改动 {changed} 个")
 
 
 def main():
     log(f"已打开：{bpy.data.filepath}")
-    log(f"物体数：{len(bpy.data.objects)}，材质数：{len(bpy.data.materials)}")
+    log(f"物体 {len(bpy.data.objects)} / 材质 {len(bpy.data.materials)} / 贴图 {len(bpy.data.images)}")
 
     fix_materials()
+
+    # 统计一下有多少材质终于带上贴图了
+    with_tex = 0
+    for mat in bpy.data.materials:
+        if not mat.use_nodes or mat.node_tree is None:
+            continue
+        for n in mat.node_tree.nodes:
+            if n.type == 'BSDF_PRINCIPLED' and n.inputs['Base Color'].is_linked:
+                with_tex += 1
+                break
+    log(f"带贴图的材质：{with_tex}")
 
     out_path = os.path.abspath("Jane.glb")
     kwargs = dict(
@@ -90,12 +137,10 @@ def main():
         export_yup=True,
         export_image_format='AUTO',
     )
-
     try:
         bpy.ops.export_scene.gltf(**kwargs)
     except TypeError as e:
-        # 某些版本的参数名不同，退回到最小参数集
-        log(f"参数不兼容，退回默认设置：{e}")
+        log(f"参数不兼容，退回默认：{e}")
         bpy.ops.export_scene.gltf(
             filepath=out_path,
             export_format='GLB',
@@ -104,9 +149,9 @@ def main():
         )
 
     if os.path.exists(out_path):
-        log(f"导出成功：{out_path}  大小 {os.path.getsize(out_path)/1048576:.1f} MB")
+        log(f"导出成功：{out_path}  {os.path.getsize(out_path)/1048576:.1f} MB")
     else:
-        log("导出失败：文件不存在")
+        log("导出失败")
         sys.exit(1)
 
 
