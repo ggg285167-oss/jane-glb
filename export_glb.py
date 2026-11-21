@@ -1,11 +1,8 @@
-"""Blender 无头导出 glTF (.glb)
+"""Blender 无头导出 glTF (.glb)  v3
 
-用法：
-    blender -b model.blend --python export_glb.py
-
-v2 改进：
-- 递归进节点组（Goo Engine 的贴图藏在 group 里），把贴图挖出来
-- 对 GooEngine_ToonShader 这类自定义材质，强制换成 Principled BSDF 再连贴图
+v3 改动：
+- 删掉作者的制作面板（Text / Cube / Panel / 表情控制板），只留角色和武器
+- 从全局图片池里强行找贴图，手动建 TEX_IMAGE 节点接到 Base Color
 """
 import bpy
 import os
@@ -17,20 +14,35 @@ def log(msg):
 
 
 KEYWORDS = ("base", "albedo", "diffuse", "color", "skin", "face", "hair",
-            "cloth", "body", "tex", "texture")
+            "cloth", "body", "tex", "texture", "jane")
+
+DROP = ("text", "cube", "panel", "custom", "mouth", "outfit", "arrow",
+        "control", "widget", "ik_", "marker", "empty", "label")
+
+
+def clean_scene():
+    """删掉制作面板、文字、参考方块，只留角色"""
+    removed = []
+    for obj in list(bpy.data.objects):
+        low = (obj.name or "").lower()
+        if any(k in low for k in DROP):
+            # 但不要误删角色本体
+            if "jane" in low or "dagger" in low:
+                continue
+            removed.append(obj.name)
+            bpy.data.objects.remove(obj, do_unlink=True)
+    log(f"删除辅助物 {len(removed)} 个：{removed[:12]}{'...' if len(removed) > 12 else ''}")
+    return removed
 
 
 def collect_image_nodes(node_tree, depth=0, seen=None):
-    """递归收集节点树（含节点组内部）里的图像纹理节点"""
     if seen is None:
         seen = set()
     if node_tree is None or depth > 5:
         return []
-    key = node_tree.name
-    if key in seen:
+    if node_tree.name in seen:
         return []
-    seen.add(key)
-
+    seen.add(node_tree.name)
     found = []
     for n in node_tree.nodes:
         if n.type == 'TEX_IMAGE' and n.image is not None:
@@ -40,21 +52,23 @@ def collect_image_nodes(node_tree, depth=0, seen=None):
     return found
 
 
-def pick_best(images):
-    """从候选贴图里挑最像 albedo 的一张"""
-    if not images:
-        return None
-    scored = []
-    for n in images:
-        name = ((n.name or "") + " " + (n.image.name or "")).lower()
-        score = sum(1 for k in KEYWORDS if k in name)
-        scored.append((score, n))
-    scored.sort(key=lambda x: -x[0])
-    return scored[0][1]
+def score_name(name):
+    low = (name or "").lower()
+    return sum(1 for k in KEYWORDS if k in low)
 
 
 def fix_materials():
     changed = 0
+    # 全局图片池（.blend 里打包的贴图）
+    pool = []
+    for img in bpy.data.images:
+        try:
+            if img.name and img.size[0] >= 8 and img.size[1] >= 8:
+                pool.append(img)
+        except Exception:
+            pass
+    log(f"图片池：{[(i.name, tuple(i.size)) for i in pool][:10]}")
+
     for mat in bpy.data.materials:
         if mat is None or not mat.use_nodes or mat.node_tree is None:
             continue
@@ -65,66 +79,62 @@ def fix_materials():
             out = nt.nodes.new('ShaderNodeOutputMaterial')
             out.location = (600, 0)
 
-        # 找出当前接到 Surface 上的东西
-        surface_link = out.inputs['Surface'].links[0] if out.inputs['Surface'].is_linked else None
-        surface_node = surface_link.from_node if surface_link else None
-
-        goo_like = (surface_node is not None and surface_node.type == 'GROUP') or \
-                   ("goo" in (mat.name or "").lower())
+        link = out.inputs['Surface'].links[0] if out.inputs['Surface'].is_linked else None
+        node = link.from_node if link else None
+        goo_like = (node is not None and node.type == 'GROUP') or ("goo" in (mat.name or "").lower())
 
         bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
-
-        if goo_like:
-            # 断开自定义着色器，换标准 BSDF，否则 glTF 导出器认不出来
-            if surface_link:
-                nt.links.remove(surface_link)
-            if bsdf is None:
-                bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
-                bsdf.location = (300, 0)
-            nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-            changed += 1
-
         if bsdf is None:
             bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
             bsdf.location = (300, 0)
-            nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
             changed += 1
 
-        # 递归找贴图
+        if link is not None and (goo_like or node.type != 'BSDF_PRINCIPLED'):
+            nt.links.remove(link)
+        if not out.inputs['Surface'].is_linked:
+            nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+
+        if bsdf.inputs['Base Color'].is_linked:
+            continue
+
+        # 1) 先在节点树里找
+        best = None
         imgs = collect_image_nodes(nt)
-        best = pick_best(imgs)
+        if imgs:
+            imgs.sort(key=lambda n: -score_name(n.name + " " + (n.image.name or "")))
+            best = imgs[0]
+
+        # 2) 节点树里没有，就从全局图片池按名字猜
+        if best is None and pool:
+            ranked = sorted(pool, key=lambda i: -score_name(i.name))
+            if score_name(ranked[0].name) > 0:
+                best = nt.nodes.new('ShaderNodeTexImage')
+                best.image = ranked[0]
+                best.location = (-300, 0)
+                log(f"材质 {mat.name} 用全局图片补上：{ranked[0].name}")
 
         if best is not None:
-            if not bsdf.inputs['Base Color'].is_linked:
-                nt.links.new(best.outputs['Color'], bsdf.inputs['Base Color'])
-            # 粗糙度用不上，保持默认
-            if 'Alpha' in bsdf.inputs and not bsdf.inputs['Alpha'].is_linked:
-                try:
-                    method = getattr(mat, "blend_method", "OPAQUE")
-                except Exception:
-                    method = "OPAQUE"
-                if method in {"BLEND", "HASHED", "CLIP"}:
-                    nt.links.new(best.outputs['Alpha'], bsdf.inputs['Alpha'])
+            nt.links.new(best.outputs['Color'], bsdf.inputs['Base Color'])
+            changed += 1
 
-    log(f"材质处理完成，改动 {changed} 个")
+    log(f"材质处理：改动 {changed}")
 
 
 def main():
-    log(f"已打开：{bpy.data.filepath}")
-    log(f"物体 {len(bpy.data.objects)} / 材质 {len(bpy.data.materials)} / 贴图 {len(bpy.data.images)}")
+    log(f"打开：{bpy.data.filepath}")
+    log(f"物体 {len(bpy.data.objects)} / 材质 {len(bpy.data.materials)} / 图片 {len(bpy.data.images)}")
+
+    clean_scene()
+
+    left = [o.name for o in bpy.data.objects]
+    log(f"保留物体 {len(left)}：{left[:15]}")
 
     fix_materials()
 
-    # 统计一下有多少材质终于带上贴图了
-    with_tex = 0
-    for mat in bpy.data.materials:
-        if not mat.use_nodes or mat.node_tree is None:
-            continue
-        for n in mat.node_tree.nodes:
-            if n.type == 'BSDF_PRINCIPLED' and n.inputs['Base Color'].is_linked:
-                with_tex += 1
-                break
-    log(f"带贴图的材质：{with_tex}")
+    for o in bpy.data.objects:
+        o.hide_set(False)
+        o.hide_viewport = False
+        o.hide_render = False
 
     out_path = os.path.abspath("Jane.glb")
     kwargs = dict(
@@ -140,7 +150,7 @@ def main():
     try:
         bpy.ops.export_scene.gltf(**kwargs)
     except TypeError as e:
-        log(f"参数不兼容，退回默认：{e}")
+        log(f"参数不兼容：{e}")
         bpy.ops.export_scene.gltf(
             filepath=out_path,
             export_format='GLB',
@@ -149,7 +159,7 @@ def main():
         )
 
     if os.path.exists(out_path):
-        log(f"导出成功：{out_path}  {os.path.getsize(out_path)/1048576:.1f} MB")
+        log(f"导出成功 {os.path.getsize(out_path)/1048576:.1f} MB")
     else:
         log("导出失败")
         sys.exit(1)
