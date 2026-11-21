@@ -131,6 +131,21 @@ def main():
 
     fix_materials()
 
+    log("=== 网格顶点统计（应用修改器前）===")
+    dg = bpy.context.evaluated_depsgraph_get()
+    for ob in bpy.data.objects:
+        if ob.type != 'MESH':
+            continue
+        base = len(ob.data.vertices)
+        ev = ob.evaluated_get(dg)
+        try:
+            me = ev.to_mesh()
+            after = len(me.vertices)
+            ev.to_mesh_clear()
+        except Exception as e:
+            after = f"求值失败:{e}"
+        log(f"  {ob.name}: 原始 {base} 顶点 / 求值后 {after}")
+
     for o in bpy.data.objects:
         o.hide_set(False)
         o.hide_viewport = False
@@ -141,7 +156,7 @@ def main():
         filepath=out_path,
         export_format='GLB',
         use_selection=False,
-        export_apply=True,
+        export_apply=False,
         export_animations=True,
         export_skins=True,
         export_yup=True,
