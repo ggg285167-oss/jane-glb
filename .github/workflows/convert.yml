@@ -1,0 +1,50 @@
+name: blend-to-glb
+
+on:
+  workflow_dispatch:
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: download-blend
+        run: |
+          curl -L --retry 3 --retry-delay 5 -f -o model.blend 'https://na2.files.open3dlab.com/na2-data/file/2025/0f37bedd-04b8-4c49-b49b-ef2fc845f7d3/67ab5ec5-8ba0-4809-b711-d4dfdd7b384e/Jane_V2.1.blend?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=GKee7ac6689c4801ef6908a3de%2F20261121%2Fgarage%2Fs3%2Faws4_request&X-Amz-Date=20261121T140245Z&X-Amz-Expires=43200&X-Amz-SignedHeaders=host&X-Amz-Signature=7f1153f7dbc455243fbf49f722950b1eaade2dfdc93d2e30e8f19bf553a640aa'
+          ls -lh model.blend
+
+      - name: verify
+        run: |
+          SIZE=$(stat -c%s model.blend)
+          echo "size: $SIZE"
+          if [ "$SIZE" -ne 55650401 ]; then
+            echo "::error::size mismatch, link may be expired"
+            exit 1
+          fi
+          head -c 12 model.blend; echo
+
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libgl1 libegl1 libxkbcommon0 zstd
+
+      - name: blender
+        run: |
+          curl -L -f -o blender.tar.xz https://download.blender.org/release/Blender4.3/blender-4.3.2-linux-x64.tar.xz
+          tar -xf blender.tar.xz
+
+      - name: convert
+        run: |
+          ./blender-4.3.2-linux-x64/blender -b model.blend --python export_glb.py
+          ls -lh Jane.glb
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jane-glb
+          path: Jane.glb
+          retention-days: 7
